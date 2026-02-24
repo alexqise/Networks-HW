@@ -8,32 +8,38 @@
 
 import socket
 
-serverport = 60000
 
-serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+class Server:
+    def __init__(self, serverport):
+        # take in listening port arg
+        self.serverport = serverport
+        # create socket
+        self.serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # bind to port num
+        self.serverSocket.bind(('', self.serverport))
 
-# bind to port num
-serverSocket.bind(('', serverport))
+        # begin listening
+        self.serverSocket.listen(1)
+        print(f"Server is ready to receive connections on port {self.serverport}")
 
-# server begins listening for incoming TCP requests
-serverSocket.listen(1)
-print("Server is ready to receive connections")
+    def start(self):
+        while True:
+            # creates connection socket
+            connectionSocket, addr = self.serverSocket.accept()
+            print(f"Connected by {addr}")
 
-while True:
-    # server waits on accept() for incoming requests, new socket created on return
-    connectionSocket, addr = serverSocket.accept()
-    print(f"Connected by {addr}")
+            # receive file name
+            filename = connectionSocket.recv(1024).decode()
+            print(f"Requesting file: {filename}")
 
-    # read bytes from connection
-    filename = connectionSocket.recv(1024).decode()
-    print(f"Requesting file: {filename}")
+            # open and send that file
+            file = open(filename, 'rb')
+            connectionSocket.sendall(file.read())
+            file.close()
+            connectionSocket.close()
 
-    # open the file name that has been requested
-    file = open(filename, 'rb')
 
-    # send it over
-    connectionSocket.sendall(file.read())
-
-    # close
-    file.close()
-    connectionSocket.close()
+if __name__ == '__main__':
+    server_port = int(sys.argv[1])
+    server = Server(server_port)
+    server.start()

@@ -7,36 +7,59 @@
 #
 
 import socket
+import sys
+import os
 
 
 class Server:
     def __init__(self, serverport):
-        # take in listening port arg
-        self.serverport = serverport
-        # create socket
-        self.serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # bind to port num
-        self.serverSocket.bind(('', self.serverport))
+        """
+        Initialize the server and bind to the given port.
 
-        # begin listening
+        arguments:
+        serverport -- port number to listen on
+        """
+        self.serverport = serverport
+        self.serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.serverSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.serverSocket.bind(('', self.serverport))
         self.serverSocket.listen(1)
         print(f"Server is ready to receive connections on port {self.serverport}")
 
     def start(self):
+        """
+        Accept a client connection and serve file requests in a loop.
+
+        Requests are newline-terminated file paths. Responses are the file
+        length as a newline-terminated string followed by the file data,
+        or "0\n" if the file is not found.
+        """
+        connectionSocket, addr = self.serverSocket.accept()
+        print(f"Connected by {addr}")
+
         while True:
-            # creates connection socket
-            connectionSocket, addr = self.serverSocket.accept()
-            print(f"Connected by {addr}")
+            request = b""
+            while b"\n" not in request:
+                data = connectionSocket.recv(1024)
+                if not data:
+                    connectionSocket.close()
+                    self.serverSocket.close()
+                    return
+                request += data
 
-            # receive file name
-            filename = connectionSocket.recv(1024).decode()
-            print(f"Requesting file: {filename}")
+            filename = request.decode().strip()
+            filepath = f"./data/{filename}"
+            print(f"Requesting file: {filepath}")
 
-            # open and send that file
-            file = open(filename, 'rb')
-            connectionSocket.sendall(file.read())
-            file.close()
-            connectionSocket.close()
+            if os.path.isfile(filepath):
+                with open(filepath, "rb") as f:
+                    fileData = f.read()
+                connectionSocket.sendall(f"{len(fileData)}\n".encode() + fileData)
+            else:
+                connectionSocket.sendall("0\n".encode())
+
+        connectionSocket.close()
+        self.serverSocket.close()
 
 
 if __name__ == '__main__':

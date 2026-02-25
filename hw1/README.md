@@ -11,7 +11,7 @@ Run all three programs in order:
 
 ### Files
 
-- server.py: TCP server that listens for file requests and sends back the requested manifest or video chunk with a length-prefixed response.
+- server.py: TCP server that listens for file requests and sends back the requested manifest or video chunk with its length in the header.
 - client.py: TCP client that connects through the network simulator, requests the manifest, then streams video chunks using using an ABR algo. Outputs `log.txt` and saves chunks to `tmp/`.
 - network.py: Provided network simulator that relays traffic between client and server while throttling bandwidth according to `bw.txt`.
 - video_play.py: Provided video player that displays downloaded chunks using OpenCV.

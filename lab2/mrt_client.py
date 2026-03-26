@@ -8,12 +8,9 @@
 
 import socket # for UDP connection
 import threading
-import time
 
 from mrt_segment import Segment, HEADER_SIZE, SYN, ACK, FIN, DATA
-
-# retransmission timeout in seconds
-TIMEOUT = 0.5
+from mrt_timer import Timer
 
 class Client:
     def init(self, src_port, dst_addr, dst_port, segment_size):
@@ -46,8 +43,15 @@ class Client:
         self.lock = threading.Lock()
         self.running = True
 
+        # send tracking for stop-and-wait
+        self.send_base = 0
+        self.send_end = 0
+        self.seg_dict = {}  # seq_num -> payload bytes
+        self.timer = Timer(timeout=0.5)
+
         # events for blocking calls
         self.connect_event = threading.Event()
+        self.all_acked_event = threading.Event()
 
         # spawn handler thread
         self.handler_thread = threading.Thread(
@@ -72,9 +76,7 @@ class Client:
             seq_num=0, ack_num=0, flags=SYN, rwnd=0
         )
         self.sock.sendto(syn.to_bytes(), (self.dst_addr, self.dst_port))
-
-        with self.lock:
-            self.syn_send_time = time.time()
+        self.timer.start()
 
         # block until handshake completes
         self.connect_event.wait()
@@ -89,19 +91,31 @@ class Client:
         arguments:
         data -- the bytes to be sent to the server
         """
-        # phase 4: still simple send, no sliding window yet
-        offset = 0
-        while offset < len(data):
-            chunk = data[offset:offset + self.max_payload]
-            seg = Segment(
-                self.src_port, self.dst_port,
-                seq_num=self.seq_num + offset, ack_num=self.ack_num,
-                flags=DATA | ACK, rwnd=0, payload=chunk
-            )
-            self.sock.sendto(seg.to_bytes(), (self.dst_addr, self.dst_port))
-            offset += len(chunk)
-        self.seq_num += len(data)
-        return len(data)
+        self.all_acked_event.clear()
+        if not isinstance(data, bytes):
+            data = data.encode()
+        total = len(data)
+
+        with self.lock:
+            # fragment data into segments
+            self.seg_dict = {}
+            offset = 0
+            while offset < total:
+                chunk = data[offset:offset + self.max_payload]
+                abs_seq = self.seq_num + offset
+                self.seg_dict[abs_seq] = chunk
+                offset += len(chunk)
+
+            self.send_base = self.seq_num
+            self.next_seq_num = self.seq_num
+            self.send_end = self.seq_num + total
+
+        # block until all segments are acked
+        self.all_acked_event.wait()
+
+        with self.lock:
+            self.seq_num += total
+        return total
 
     def close(self):
         """
@@ -114,8 +128,8 @@ class Client:
     def _rcv_and_sgmnt_handler(self):
         """
         Handler thread that continuously receives and processes
-        incoming segments. Handles SYN-ACK during handshake and
-        retransmits SYN on timeout.
+        incoming segments. Handles handshake, data ACKs, and
+        retransmits on timeout.
         """
         while self.running:
             # try to receive
@@ -128,20 +142,13 @@ class Client:
             except (socket.timeout, BlockingIOError, OSError):
                 pass
 
-            # check for timeouts
+            # send data + check timeouts
             with self.lock:
                 if self.state == 'CONNECTING':
-                    if time.time() - self.syn_send_time > TIMEOUT:
-                        # retransmit SYN
-                        syn = Segment(
-                            self.src_port, self.dst_port,
-                            seq_num=0, ack_num=0, flags=SYN, rwnd=0
-                        )
-                        self.sock.sendto(
-                            syn.to_bytes(),
-                            (self.dst_addr, self.dst_port)
-                        )
-                        self.syn_send_time = time.time()
+                    self._check_syn_timeout()
+                elif self.state == 'ESTABLISHED':
+                    self._send_next_segment()
+                    self._check_data_timeout()
 
     def _handle_segment(self, seg):
         """
@@ -164,4 +171,61 @@ class Client:
                         (self.dst_addr, self.dst_port)
                     )
                     self.state = 'ESTABLISHED'
+                    self.timer.stop()
                     self.connect_event.set()
+
+            elif self.state == 'ESTABLISHED':
+                if seg.has_flag(ACK):
+                    if seg.ack_num > self.send_base:
+                        # cumulative ack, advance base
+                        self.send_base = seg.ack_num
+                        self.peer_rwnd = seg.rwnd
+                        if self.send_base >= self.send_end:
+                            # all data acked
+                            self.timer.stop()
+                            self.all_acked_event.set()
+                        else:
+                            # restart timer for remaining data
+                            self.timer.reset()
+
+    def _send_next_segment(self):
+        """
+        Send the next unsent segment (stop-and-wait). Only sends
+        if the previous segment was acked.
+        """
+        if (self.send_base < self.send_end
+                and self.next_seq_num == self.send_base
+                and self.next_seq_num in self.seg_dict):
+            payload = self.seg_dict[self.next_seq_num]
+            seg = Segment(
+                self.src_port, self.dst_port,
+                seq_num=self.next_seq_num, ack_num=self.ack_num,
+                flags=DATA | ACK, rwnd=0, payload=payload
+            )
+            self.sock.sendto(
+                seg.to_bytes(), (self.dst_addr, self.dst_port)
+            )
+            self.next_seq_num += len(payload)
+            self.timer.start()
+
+    def _check_data_timeout(self):
+        """
+        If timeout expired, retransmit from send_base.
+        """
+        if self.timer.is_expired() and self.send_base < self.send_end:
+            self.next_seq_num = self.send_base
+            self.timer.start()
+
+    def _check_syn_timeout(self):
+        """
+        Retransmit SYN if timeout expired during handshake.
+        """
+        if self.timer.is_expired():
+            syn = Segment(
+                self.src_port, self.dst_port,
+                seq_num=0, ack_num=0, flags=SYN, rwnd=0
+            )
+            self.sock.sendto(
+                syn.to_bytes(), (self.dst_addr, self.dst_port)
+            )
+            self.timer.start()

@@ -200,9 +200,20 @@ class Server:
 
     def _process_data(self, seg, addr):
         """
-        Process a data segment. For now just appends payload
-        to data_buffer (no ordering/ack logic yet).
+        Process a data segment. Only accepts in-order segments
+        (seq_num == expected). Sends cumulative ACK either way.
         """
-        if seg.payload_length > 0:
+        if (seg.seq_num == self.expected_seq_num
+                and seg.payload_length > 0):
             self.data_buffer.extend(seg.payload)
+            self.expected_seq_num += seg.payload_length
             self.data_cond.notify_all()
+
+        # always send cumulative ack with current rwnd
+        rwnd = self.receive_buffer_size - len(self.data_buffer)
+        ack = Segment(
+            self.src_port, seg.src_port,
+            seq_num=0, ack_num=self.expected_seq_num,
+            flags=ACK, rwnd=rwnd
+        )
+        self.sock.sendto(ack.to_bytes(), addr)

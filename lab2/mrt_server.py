@@ -1,8 +1,8 @@
-# 
+#
 # Columbia University - CSEE 4119 Computer Networks
 # Assignment 2 - Mini Reliable Transport Protocol
 #
-# mrt_server.py - defining server APIs of the mini reliable transport 
+# mrt_server.py - defining server APIs of the mini reliable transport
 # protocol
 #
 
@@ -20,27 +20,34 @@ class Server:
         src_port -- the port the server is using to receive segments
         receive_buffer_size -- the maximum size of the receive buffer
         """
-        pass
+        self.src_port = src_port
+        self.receive_buffer_size = receive_buffer_size
+
+        # Create and bind UDP socket
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(('', src_port))
 
     def accept(self):
         """
         accept a client request
         blocking until a client is accepted
 
-        it should support protection against segment loss/corruption/reordering 
+        it should support protection against segment loss/corruption/reordering
 
         return:
-        the connection to the client 
+        the connection to the client
         """
-        conn = None
-        return conn
+        # Phase 1: wait for any data to learn client address
+        _, addr = self.sock.recvfrom(1)
+        self.client_addr = addr
+        return addr
 
     def receive(self, conn, length):
         """
         receive data from the given client
         blocking until the requested amount of data is received
-        
-        it should support protection against segment loss/corruption/reordering 
+
+        it should support protection against segment loss/corruption/reordering
         the client should never overwhelm the server given the receive buffer size
 
         arguments:
@@ -50,12 +57,16 @@ class Server:
         return:
         data -- the bytes received from the client, guaranteed to be in its original order
         """
+        # Phase 1: simple raw UDP receive for testing
         data = b""
-        return data
+        while len(data) < length:
+            chunk, _ = self.sock.recvfrom(65535)
+            data += chunk
+        return data[:length]
 
     def close(self):
         """
         close the server and the client if it is still connected
         blocking until the connection is closed
         """
-        pass
+        self.sock.close()

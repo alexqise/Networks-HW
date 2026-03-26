@@ -10,8 +10,10 @@ import socket # for UDP connection
 import threading
 import queue
 import datetime
+import time
 
 from mrt_segment import Segment, HEADER_SIZE, SYN, ACK, FIN, DATA
+from mrt_timer import Timer
 
 #
 # Server
@@ -50,6 +52,9 @@ class Server:
         # data_buffer: in-order app data for receive() to read from
         self.data_buffer = bytearray()
         self.data_cond = threading.Condition(self.lock)
+
+        # timer for FIN_RCVD timeout
+        self.fin_timer = Timer(timeout=3.0)
 
         # logging
         self.log_file = open(f"log_{src_port}.txt", "w")
@@ -144,6 +149,12 @@ class Server:
             try:
                 seg, addr = self.receive_buffer.get(timeout=0.1)
             except queue.Empty:
+                # check if FIN_RCVD timed out waiting for final ACK
+                with self.data_cond:
+                    if (self.state == 'FIN_RCVD'
+                            and self.fin_timer.is_expired()):
+                        self.state = 'CLOSED'
+                        self.close_event.set()
                 continue
 
             self._log(seg)
@@ -223,9 +234,11 @@ class Server:
     def _handle_fin(self, seg, addr):
         """
         Handle a FIN from the client. Send FIN-ACK and
-        move to FIN_RCVD.
+        move to FIN_RCVD. Start a timer so we don't wait
+        forever if the final ACK is lost.
         """
         self.state = 'FIN_RCVD'
+        self.fin_timer.start()
         fin_ack = Segment(
             self.src_port, seg.src_port,
             seq_num=0, ack_num=seg.seq_num + 1,

@@ -34,8 +34,13 @@ class Server:
         # connection state
         self.state = 'LISTEN'
         self.client_addr = None
+        self.client_port = None
+        self.expected_seq_num = 0
         self.lock = threading.Lock()
         self.running = True
+
+        # events for blocking calls
+        self.connect_event = threading.Event()
 
         # buffers
         # receive_buffer: raw segments from rcv_handler -> sgmnt_handler
@@ -64,9 +69,8 @@ class Server:
         return:
         the connection to the client
         """
-        # phase 3: just wait until we know who the client is
-        while self.client_addr is None:
-            pass
+        # block until 3-way handshake completes
+        self.connect_event.wait()
         return self.client_addr
 
     def receive(self, conn, length):
@@ -118,7 +122,8 @@ class Server:
     def _sgmnt_handler(self):
         """
         Segment handler thread: processes segments from the
-        receive_buffer and puts app data into data_buffer.
+        receive_buffer. Handles handshake and puts app data
+        into data_buffer.
         """
         while self.running:
             try:
@@ -127,11 +132,77 @@ class Server:
                 continue
 
             with self.data_cond:
-                # remember who the client is
-                if self.client_addr is None:
-                    self.client_addr = addr
+                if self.state == 'LISTEN':
+                    self._handle_listen(seg, addr)
 
-                # phase 3: just dump payload into data_buffer
-                if seg.has_flag(DATA) and seg.payload_length > 0:
-                    self.data_buffer.extend(seg.payload)
-                    self.data_cond.notify_all()
+                elif self.state == 'SYN_RCVD':
+                    self._handle_syn_rcvd(seg, addr)
+
+                elif self.state == 'ESTABLISHED':
+                    self._handle_established(seg, addr)
+
+    def _handle_listen(self, seg, addr):
+        """
+        Handle segments in LISTEN state. If we get a SYN,
+        send SYN-ACK and move to SYN_RCVD.
+        """
+        if seg.has_flag(SYN):
+            self.client_addr = addr
+            self.client_port = seg.src_port
+            self.expected_seq_num = seg.seq_num + 1  # SYN consumes 1
+            self.state = 'SYN_RCVD'
+
+            syn_ack = Segment(
+                self.src_port, seg.src_port,
+                seq_num=0, ack_num=self.expected_seq_num,
+                flags=SYN | ACK,
+                rwnd=self.receive_buffer_size
+            )
+            self.sock.sendto(syn_ack.to_bytes(), addr)
+
+    def _handle_syn_rcvd(self, seg, addr):
+        """
+        Handle segments in SYN_RCVD state. If we get ACK,
+        handshake is done. If duplicate SYN, resend SYN-ACK.
+        If DATA arrives, treat as implicit ACK.
+        """
+        if seg.has_flag(SYN) and not seg.has_flag(ACK):
+            # duplicate SYN, resend SYN-ACK
+            syn_ack = Segment(
+                self.src_port, seg.src_port,
+                seq_num=0, ack_num=self.expected_seq_num,
+                flags=SYN | ACK,
+                rwnd=self.receive_buffer_size
+            )
+            self.sock.sendto(syn_ack.to_bytes(), addr)
+
+        elif seg.has_flag(ACK):
+            # handshake complete
+            self.state = 'ESTABLISHED'
+            self.connect_event.set()
+            # if this ACK also has data, process it
+            if seg.has_flag(DATA):
+                self._process_data(seg, addr)
+
+        elif seg.has_flag(DATA):
+            # data without ACK flag = implicit handshake done
+            self.state = 'ESTABLISHED'
+            self.connect_event.set()
+            self._process_data(seg, addr)
+
+    def _handle_established(self, seg, addr):
+        """
+        Handle segments in ESTABLISHED state. Process data
+        segments.
+        """
+        if seg.has_flag(DATA):
+            self._process_data(seg, addr)
+
+    def _process_data(self, seg, addr):
+        """
+        Process a data segment. For now just appends payload
+        to data_buffer (no ordering/ack logic yet).
+        """
+        if seg.payload_length > 0:
+            self.data_buffer.extend(seg.payload)
+            self.data_cond.notify_all()

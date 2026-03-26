@@ -8,8 +8,12 @@
 
 import socket # for UDP connection
 import threading
+import time
 
 from mrt_segment import Segment, HEADER_SIZE, SYN, ACK, FIN, DATA
+
+# retransmission timeout in seconds
+TIMEOUT = 0.5
 
 class Client:
     def init(self, src_port, dst_addr, dst_port, segment_size):
@@ -36,8 +40,14 @@ class Client:
 
         # connection state
         self.state = 'CLOSED'
+        self.seq_num = 0
+        self.ack_num = 0
+        self.peer_rwnd = 0
         self.lock = threading.Lock()
         self.running = True
+
+        # events for blocking calls
+        self.connect_event = threading.Event()
 
         # spawn handler thread
         self.handler_thread = threading.Thread(
@@ -52,7 +62,22 @@ class Client:
 
         it should support protection against segment loss/corruption/reordering
         """
-        pass
+        with self.lock:
+            self.state = 'CONNECTING'
+            self.seq_num = 0
+
+        # send initial SYN, handler thread will retransmit on timeout
+        syn = Segment(
+            self.src_port, self.dst_port,
+            seq_num=0, ack_num=0, flags=SYN, rwnd=0
+        )
+        self.sock.sendto(syn.to_bytes(), (self.dst_addr, self.dst_port))
+
+        with self.lock:
+            self.syn_send_time = time.time()
+
+        # block until handshake completes
+        self.connect_event.wait()
 
     def send(self, data):
         """
@@ -64,17 +89,18 @@ class Client:
         arguments:
         data -- the bytes to be sent to the server
         """
-        # phase 3: just send raw segments through the handler for now
+        # phase 4: still simple send, no sliding window yet
         offset = 0
         while offset < len(data):
             chunk = data[offset:offset + self.max_payload]
             seg = Segment(
                 self.src_port, self.dst_port,
-                seq_num=offset, ack_num=0,
-                flags=DATA, rwnd=0, payload=chunk
+                seq_num=self.seq_num + offset, ack_num=self.ack_num,
+                flags=DATA | ACK, rwnd=0, payload=chunk
             )
             self.sock.sendto(seg.to_bytes(), (self.dst_addr, self.dst_port))
             offset += len(chunk)
+        self.seq_num += len(data)
         return len(data)
 
     def close(self):
@@ -88,15 +114,54 @@ class Client:
     def _rcv_and_sgmnt_handler(self):
         """
         Handler thread that continuously receives and processes
-        incoming segments. For now just prints what it gets.
+        incoming segments. Handles SYN-ACK during handshake and
+        retransmits SYN on timeout.
         """
         while self.running:
+            # try to receive
             try:
                 raw, addr = self.sock.recvfrom(65535)
                 seg = Segment.from_bytes(raw)
                 if seg is None:
                     continue  # corrupt, drop
-                with self.lock:
-                    print(f"[client] got {seg.type_str()} seq={seg.seq_num} ack={seg.ack_num}")
+                self._handle_segment(seg)
             except (socket.timeout, BlockingIOError, OSError):
                 pass
+
+            # check for timeouts
+            with self.lock:
+                if self.state == 'CONNECTING':
+                    if time.time() - self.syn_send_time > TIMEOUT:
+                        # retransmit SYN
+                        syn = Segment(
+                            self.src_port, self.dst_port,
+                            seq_num=0, ack_num=0, flags=SYN, rwnd=0
+                        )
+                        self.sock.sendto(
+                            syn.to_bytes(),
+                            (self.dst_addr, self.dst_port)
+                        )
+                        self.syn_send_time = time.time()
+
+    def _handle_segment(self, seg):
+        """
+        Process a received segment based on current state.
+        """
+        with self.lock:
+            if self.state == 'CONNECTING':
+                if seg.has_flag(SYN) and seg.has_flag(ACK):
+                    # got SYN-ACK, send final ACK
+                    self.ack_num = seg.seq_num + 1
+                    self.seq_num = 1  # SYN consumed 1 seq number
+                    self.peer_rwnd = seg.rwnd
+                    ack = Segment(
+                        self.src_port, self.dst_port,
+                        seq_num=self.seq_num, ack_num=self.ack_num,
+                        flags=ACK, rwnd=0
+                    )
+                    self.sock.sendto(
+                        ack.to_bytes(),
+                        (self.dst_addr, self.dst_port)
+                    )
+                    self.state = 'ESTABLISHED'
+                    self.connect_event.set()

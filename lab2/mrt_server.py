@@ -203,14 +203,16 @@ class Server:
         Process a data segment. Only accepts in-order segments
         (seq_num == expected). Sends cumulative ACK either way.
         """
+        remaining = self.receive_buffer_size - len(self.data_buffer)
         if (seg.seq_num == self.expected_seq_num
-                and seg.payload_length > 0):
+                and seg.payload_length > 0
+                and seg.payload_length <= remaining):
             self.data_buffer.extend(seg.payload)
             self.expected_seq_num += seg.payload_length
             self.data_cond.notify_all()
 
         # always send cumulative ack with current rwnd
-        rwnd = self.receive_buffer_size - len(self.data_buffer)
+        rwnd = max(0, self.receive_buffer_size - len(self.data_buffer))
         ack = Segment(
             self.src_port, seg.src_port,
             seq_num=0, ack_num=self.expected_seq_num,

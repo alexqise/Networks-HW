@@ -9,6 +9,7 @@
 import socket # for UDP connection
 import threading
 import queue
+import datetime
 
 from mrt_segment import Segment, HEADER_SIZE, SYN, ACK, FIN, DATA
 
@@ -41,6 +42,7 @@ class Server:
 
         # events for blocking calls
         self.connect_event = threading.Event()
+        self.close_event = threading.Event()
 
         # buffers
         # receive_buffer: raw segments from rcv_handler -> sgmnt_handler
@@ -48,6 +50,9 @@ class Server:
         # data_buffer: in-order app data for receive() to read from
         self.data_buffer = bytearray()
         self.data_cond = threading.Condition(self.lock)
+
+        # logging
+        self.log_file = open(f"log_{src_port}.txt", "w")
 
         # spawn handler threads
         self.rcv_thread = threading.Thread(
@@ -101,8 +106,19 @@ class Server:
         close the server and the client if it is still connected
         blocking until the connection is closed
         """
+        # wait for FIN exchange if still connected
+        if self.state not in ('CLOSED', 'LISTEN'):
+            self.close_event.wait(timeout=10)
         self.running = False
         self.sock.close()
+        self.log_file.close()
+
+    def _send_seg(self, seg, addr):
+        """
+        Send a segment over the socket and log it.
+        """
+        self.sock.sendto(seg.to_bytes(), addr)
+        self._log(seg)
 
     def _rcv_handler(self):
         """
@@ -122,14 +138,15 @@ class Server:
     def _sgmnt_handler(self):
         """
         Segment handler thread: processes segments from the
-        receive_buffer. Handles handshake and puts app data
-        into data_buffer.
+        receive_buffer. Handles handshake, data, and teardown.
         """
         while self.running:
             try:
                 seg, addr = self.receive_buffer.get(timeout=0.1)
             except queue.Empty:
                 continue
+
+            self._log(seg)
 
             with self.data_cond:
                 if self.state == 'LISTEN':
@@ -140,6 +157,9 @@ class Server:
 
                 elif self.state == 'ESTABLISHED':
                     self._handle_established(seg, addr)
+
+                elif self.state == 'FIN_RCVD':
+                    self._handle_fin_rcvd(seg, addr)
 
     def _handle_listen(self, seg, addr):
         """
@@ -158,7 +178,7 @@ class Server:
                 flags=SYN | ACK,
                 rwnd=self.receive_buffer_size
             )
-            self.sock.sendto(syn_ack.to_bytes(), addr)
+            self._send_seg(syn_ack, addr)
 
     def _handle_syn_rcvd(self, seg, addr):
         """
@@ -174,7 +194,7 @@ class Server:
                 flags=SYN | ACK,
                 rwnd=self.receive_buffer_size
             )
-            self.sock.sendto(syn_ack.to_bytes(), addr)
+            self._send_seg(syn_ack, addr)
 
         elif seg.has_flag(ACK):
             # handshake complete
@@ -193,10 +213,43 @@ class Server:
     def _handle_established(self, seg, addr):
         """
         Handle segments in ESTABLISHED state. Process data
-        segments.
+        segments or start teardown on FIN.
         """
         if seg.has_flag(DATA):
             self._process_data(seg, addr)
+        elif seg.has_flag(FIN):
+            self._handle_fin(seg, addr)
+
+    def _handle_fin(self, seg, addr):
+        """
+        Handle a FIN from the client. Send FIN-ACK and
+        move to FIN_RCVD.
+        """
+        self.state = 'FIN_RCVD'
+        fin_ack = Segment(
+            self.src_port, seg.src_port,
+            seq_num=0, ack_num=seg.seq_num + 1,
+            flags=FIN | ACK, rwnd=0
+        )
+        self._send_seg(fin_ack, addr)
+
+    def _handle_fin_rcvd(self, seg, addr):
+        """
+        Handle segments in FIN_RCVD state. If we get the
+        final ACK, we're done. If duplicate FIN, resend
+        FIN-ACK.
+        """
+        if seg.has_flag(ACK) and not seg.has_flag(FIN):
+            self.state = 'CLOSED'
+            self.close_event.set()
+        elif seg.has_flag(FIN):
+            # duplicate FIN, resend FIN-ACK
+            fin_ack = Segment(
+                self.src_port, seg.src_port,
+                seq_num=0, ack_num=seg.seq_num + 1,
+                flags=FIN | ACK, rwnd=0
+            )
+            self._send_seg(fin_ack, addr)
 
     def _process_data(self, seg, addr):
         """
@@ -217,4 +270,17 @@ class Server:
             seq_num=0, ack_num=self.expected_seq_num,
             flags=ACK, rwnd=self.receive_buffer_size
         )
-        self.sock.sendto(ack.to_bytes(), addr)
+        self._send_seg(ack, addr)
+
+    def _log(self, seg):
+        """
+        Log a segment to the log file.
+        """
+        now = datetime.datetime.utcnow()
+        ts = now.strftime('%Y-%m-%d %H:%M:%S') + f'.{now.microsecond // 1000:03d}'
+        self.log_file.write(
+            f"{ts} {seg.src_port} {seg.dst_port} "
+            f"{seg.seq_num} {seg.ack_num} {seg.type_str()} "
+            f"{seg.payload_length}\n"
+        )
+        self.log_file.flush()

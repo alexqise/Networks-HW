@@ -8,6 +8,7 @@
 
 import socket # for UDP connection
 import threading
+import datetime
 
 from mrt_segment import Segment, HEADER_SIZE, SYN, ACK, FIN, DATA
 from mrt_timer import Timer
@@ -53,6 +54,10 @@ class Client:
         # events for blocking calls
         self.connect_event = threading.Event()
         self.all_acked_event = threading.Event()
+        self.close_event = threading.Event()
+
+        # logging
+        self.log_file = open(f"log_{src_port}.txt", "w")
 
         # spawn handler thread
         self.handler_thread = threading.Thread(
@@ -76,7 +81,7 @@ class Client:
             self.src_port, self.dst_port,
             seq_num=0, ack_num=0, flags=SYN, rwnd=0
         )
-        self.sock.sendto(syn.to_bytes(), (self.dst_addr, self.dst_port))
+        self._send_seg(syn)
         self.timer.start()
 
         # block until handshake completes
@@ -123,8 +128,30 @@ class Client:
         request to close the connection with the server
         blocking until the connection is closed
         """
+        with self.lock:
+            self.state = 'FIN_SENT'
+
+        # send FIN, handler thread will retransmit on timeout
+        fin = Segment(
+            self.src_port, self.dst_port,
+            seq_num=self.seq_num, ack_num=self.ack_num,
+            flags=FIN, rwnd=0
+        )
+        self._send_seg(fin)
+        self.timer.start()
+
+        # block until teardown completes
+        self.close_event.wait()
         self.running = False
         self.sock.close()
+        self.log_file.close()
+
+    def _send_seg(self, seg):
+        """
+        Send a segment over the socket and log it.
+        """
+        self.sock.sendto(seg.to_bytes(), (self.dst_addr, self.dst_port))
+        self._log(seg)
 
     def _rcv_and_sgmnt_handler(self):
         """
@@ -140,6 +167,7 @@ class Client:
                 seg = Segment.from_bytes(raw)
                 if seg is None:
                     continue  # corrupt, drop
+                self._log(seg)
                 self._handle_segment(seg)
             except (socket.timeout, BlockingIOError, OSError):
                 pass
@@ -151,6 +179,8 @@ class Client:
                 elif self.state == 'ESTABLISHED':
                     self._send_window()
                     self._check_data_timeout()
+                elif self.state == 'FIN_SENT':
+                    self._check_fin_timeout()
 
     def _handle_segment(self, seg):
         """
@@ -168,10 +198,7 @@ class Client:
                         seq_num=self.seq_num, ack_num=self.ack_num,
                         flags=ACK, rwnd=0
                     )
-                    self.sock.sendto(
-                        ack.to_bytes(),
-                        (self.dst_addr, self.dst_port)
-                    )
+                    self._send_seg(ack)
                     self.state = 'ESTABLISHED'
                     self.timer.stop()
                     self.connect_event.set()
@@ -190,6 +217,19 @@ class Client:
                             # restart timer for remaining data
                             self.timer.reset()
 
+            elif self.state == 'FIN_SENT':
+                if seg.has_flag(FIN) and seg.has_flag(ACK):
+                    # got FIN-ACK, send final ACK
+                    ack = Segment(
+                        self.src_port, self.dst_port,
+                        seq_num=self.seq_num, ack_num=seg.seq_num + 1,
+                        flags=ACK, rwnd=0
+                    )
+                    self._send_seg(ack)
+                    self.state = 'CLOSED'
+                    self.timer.stop()
+                    self.close_event.set()
+
     def _send_window(self):
         """
         Send as many segments as the GBN window allows.
@@ -207,9 +247,7 @@ class Client:
                 seq_num=self.next_seq_num, ack_num=self.ack_num,
                 flags=DATA | ACK, rwnd=0, payload=payload
             )
-            self.sock.sendto(
-                seg.to_bytes(), (self.dst_addr, self.dst_port)
-            )
+            self._send_seg(seg)
             # start timer when first segment in window is sent
             if self.next_seq_num == self.send_base:
                 self.timer.start()
@@ -233,7 +271,31 @@ class Client:
                 self.src_port, self.dst_port,
                 seq_num=0, ack_num=0, flags=SYN, rwnd=0
             )
-            self.sock.sendto(
-                syn.to_bytes(), (self.dst_addr, self.dst_port)
-            )
+            self._send_seg(syn)
             self.timer.start()
+
+    def _check_fin_timeout(self):
+        """
+        Retransmit FIN if timeout expired during teardown.
+        """
+        if self.timer.is_expired():
+            fin = Segment(
+                self.src_port, self.dst_port,
+                seq_num=self.seq_num, ack_num=self.ack_num,
+                flags=FIN, rwnd=0
+            )
+            self._send_seg(fin)
+            self.timer.start()
+
+    def _log(self, seg):
+        """
+        Log a segment to the log file.
+        """
+        now = datetime.datetime.utcnow()
+        ts = now.strftime('%Y-%m-%d %H:%M:%S') + f'.{now.microsecond // 1000:03d}'
+        self.log_file.write(
+            f"{ts} {seg.src_port} {seg.dst_port} "
+            f"{seg.seq_num} {seg.ack_num} {seg.type_str()} "
+            f"{seg.payload_length}\n"
+        )
+        self.log_file.flush()

@@ -210,10 +210,11 @@ class Server:
             self.data_cond.notify_all()
 
         # always send cumulative ack with current rwnd
-        rwnd = max(0, self.receive_buffer_size - len(self.data_buffer))
+        # with GBN the receiver doesn't buffer out-of-order segments,
+        # so rwnd just advertises the receive buffer size
         ack = Segment(
             self.src_port, seg.src_port,
             seq_num=0, ack_num=self.expected_seq_num,
-            flags=ACK, rwnd=rwnd
+            flags=ACK, rwnd=self.receive_buffer_size
         )
         self.sock.sendto(ack.to_bytes(), addr)

@@ -43,8 +43,9 @@ class Client:
         self.lock = threading.Lock()
         self.running = True
 
-        # send tracking for stop-and-wait
+        # GBN sliding window state
         self.send_base = 0
+        self.next_seq_num = 0
         self.send_end = 0
         self.seg_dict = {}  # seq_num -> payload bytes
         self.timer = Timer(timeout=0.5)
@@ -128,8 +129,9 @@ class Client:
     def _rcv_and_sgmnt_handler(self):
         """
         Handler thread that continuously receives and processes
-        incoming segments. Handles handshake, data ACKs, and
-        retransmits on timeout.
+        incoming segments. Handles handshake, data ACKs, sends
+        new segments within the GBN window, and retransmits on
+        timeout.
         """
         while self.running:
             # try to receive
@@ -147,7 +149,7 @@ class Client:
                 if self.state == 'CONNECTING':
                     self._check_syn_timeout()
                 elif self.state == 'ESTABLISHED':
-                    self._send_next_segment()
+                    self._send_window()
                     self._check_data_timeout()
 
     def _handle_segment(self, seg):
@@ -188,14 +190,17 @@ class Client:
                             # restart timer for remaining data
                             self.timer.reset()
 
-    def _send_next_segment(self):
+    def _send_window(self):
         """
-        Send the next unsent segment (stop-and-wait). Only sends
-        if the previous segment was acked.
+        Send as many segments as the GBN window allows.
+        Window is limited by peer_rwnd (flow control).
         """
-        if (self.send_base < self.send_end
-                and self.next_seq_num == self.send_base
-                and self.next_seq_num in self.seg_dict):
+        if self.send_base >= self.send_end:
+            return
+
+        while (self.next_seq_num < self.send_end
+               and self.next_seq_num - self.send_base < self.peer_rwnd
+               and self.next_seq_num in self.seg_dict):
             payload = self.seg_dict[self.next_seq_num]
             seg = Segment(
                 self.src_port, self.dst_port,
@@ -205,14 +210,17 @@ class Client:
             self.sock.sendto(
                 seg.to_bytes(), (self.dst_addr, self.dst_port)
             )
+            # start timer when first segment in window is sent
+            if self.next_seq_num == self.send_base:
+                self.timer.start()
             self.next_seq_num += len(payload)
-            self.timer.start()
 
     def _check_data_timeout(self):
         """
-        If timeout expired, retransmit from send_base.
+        GBN timeout: retransmit entire window from send_base.
         """
         if self.timer.is_expired() and self.send_base < self.send_end:
+            # reset next_seq_num to resend everything from base
             self.next_seq_num = self.send_base
             self.timer.start()
 

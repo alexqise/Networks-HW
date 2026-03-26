@@ -129,6 +129,12 @@ class Client:
         blocking until the connection is closed
         """
         with self.lock:
+            # if server already closed us, just clean up
+            if self.state == 'CLOSED':
+                self.running = False
+                self.sock.close()
+                self.log_file.close()
+                return
             self.state = 'FIN_SENT'
 
         # send FIN, handler thread will retransmit on timeout
@@ -204,11 +210,25 @@ class Client:
                     self.connect_event.set()
 
             elif self.state == 'ESTABLISHED':
-                if seg.has_flag(ACK):
+                if seg.has_flag(FIN):
+                    # server initiated close, send FIN-ACK
+                    ack = Segment(
+                        self.src_port, self.dst_port,
+                        seq_num=self.seq_num, ack_num=seg.seq_num + 1,
+                        flags=FIN | ACK, rwnd=0
+                    )
+                    self._send_seg(ack)
+                    self.state = 'CLOSED'
+                    self.timer.stop()
+                    # unblock send() if it's waiting
+                    self.all_acked_event.set()
+                    self.close_event.set()
+                elif seg.has_flag(ACK):
+                    # update rwnd even if ack_num hasn't advanced
+                    self.peer_rwnd = seg.rwnd
                     if seg.ack_num > self.send_base:
                         # cumulative ack, advance base
                         self.send_base = seg.ack_num
-                        self.peer_rwnd = seg.rwnd
                         if self.send_base >= self.send_end:
                             # all data acked
                             self.timer.stop()
@@ -224,6 +244,18 @@ class Client:
                         self.src_port, self.dst_port,
                         seq_num=self.seq_num, ack_num=seg.seq_num + 1,
                         flags=ACK, rwnd=0
+                    )
+                    self._send_seg(ack)
+                    self.state = 'CLOSED'
+                    self.timer.stop()
+                    self.close_event.set()
+                elif seg.has_flag(FIN):
+                    # server also trying to close (simultaneous close)
+                    # send FIN-ACK back
+                    ack = Segment(
+                        self.src_port, self.dst_port,
+                        seq_num=self.seq_num, ack_num=seg.seq_num + 1,
+                        flags=FIN | ACK, rwnd=0
                     )
                     self._send_seg(ack)
                     self.state = 'CLOSED'
@@ -256,8 +288,24 @@ class Client:
     def _check_data_timeout(self):
         """
         GBN timeout: retransmit entire window from send_base.
+        Also probes if rwnd is 0.
         """
-        if self.timer.is_expired() and self.send_base < self.send_end:
+        if not self.timer.is_expired() or self.send_base >= self.send_end:
+            return
+
+        if self.peer_rwnd == 0:
+            # zero window probe: resend from base to get a fresh ACK
+            # with updated rwnd
+            if self.send_base in self.seg_dict:
+                payload = self.seg_dict[self.send_base]
+                seg = Segment(
+                    self.src_port, self.dst_port,
+                    seq_num=self.send_base, ack_num=self.ack_num,
+                    flags=DATA | ACK, rwnd=0, payload=payload
+                )
+                self._send_seg(seg)
+            self.timer.start()
+        else:
             # reset next_seq_num to resend everything from base
             self.next_seq_num = self.send_base
             self.timer.start()

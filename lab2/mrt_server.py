@@ -98,22 +98,41 @@ class Server:
         return:
         data -- the bytes received from the client, guaranteed to be in its original order
         """
-        # block until we have enough data
+        # read data incrementally so the buffer frees up space
+        # for flow control to work properly
+        result = bytearray()
         with self.data_cond:
-            while len(self.data_buffer) < length:
-                self.data_cond.wait()
-            data = bytes(self.data_buffer[:length])
-            del self.data_buffer[:length]
-        return data
+            while len(result) < length:
+                # wait for any data to show up
+                while len(self.data_buffer) == 0:
+                    self.data_cond.wait()
+                # take as much as we need (or as much as is available)
+                needed = length - len(result)
+                take = min(needed, len(self.data_buffer))
+                result.extend(self.data_buffer[:take])
+                del self.data_buffer[:take]
+        return bytes(result)
 
     def close(self):
         """
         close the server and the client if it is still connected
         blocking until the connection is closed
         """
-        # wait for FIN exchange if still connected
+        with self.lock:
+            if self.state == 'ESTABLISHED' and self.client_addr is not None:
+                # server-initiated close: send FIN to client
+                self.state = 'FIN_SENT'
+                fin = Segment(
+                    self.src_port, self.client_port,
+                    seq_num=0, ack_num=self.expected_seq_num,
+                    flags=FIN, rwnd=0
+                )
+                self._send_seg(fin, self.client_addr)
+                self.fin_timer.start()
+
+        # wait for close to complete (or timeout)
         if self.state not in ('CLOSED', 'LISTEN'):
-            self.close_event.wait(timeout=10)
+            self.close_event.wait(timeout=5)
         self.running = False
         self.sock.close()
         self.log_file.close()
@@ -149,9 +168,14 @@ class Server:
             try:
                 seg, addr = self.receive_buffer.get(timeout=0.1)
             except queue.Empty:
-                # check if FIN_RCVD timed out waiting for final ACK
                 with self.data_cond:
+                    # check if FIN_RCVD timed out waiting for final ACK
                     if (self.state == 'FIN_RCVD'
+                            and self.fin_timer.is_expired()):
+                        self.state = 'CLOSED'
+                        self.close_event.set()
+                    # give up if server-initiated close timed out
+                    elif (self.state == 'FIN_SENT'
                             and self.fin_timer.is_expired()):
                         self.state = 'CLOSED'
                         self.close_event.set()
@@ -171,6 +195,9 @@ class Server:
 
                 elif self.state == 'FIN_RCVD':
                     self._handle_fin_rcvd(seg, addr)
+
+                elif self.state == 'FIN_SENT':
+                    self._handle_fin_sent(seg, addr)
 
     def _handle_listen(self, seg, addr):
         """
@@ -264,24 +291,56 @@ class Server:
             )
             self._send_seg(fin_ack, addr)
 
+    def _handle_fin_sent(self, seg, addr):
+        """
+        Handle segments in FIN_SENT state (server-initiated close).
+        If we get FIN-ACK, ACK, or bare FIN (simultaneous close),
+        we're done.
+        """
+        if seg.has_flag(FIN) and seg.has_flag(ACK):
+            # client responded with FIN-ACK, send final ACK
+            ack = Segment(
+                self.src_port, seg.src_port,
+                seq_num=0, ack_num=seg.seq_num + 1,
+                flags=ACK, rwnd=0
+            )
+            self._send_seg(ack, addr)
+            self.state = 'CLOSED'
+            self.close_event.set()
+        elif seg.has_flag(FIN):
+            # simultaneous close: client also sent FIN
+            ack = Segment(
+                self.src_port, seg.src_port,
+                seq_num=0, ack_num=seg.seq_num + 1,
+                flags=FIN | ACK, rwnd=0
+            )
+            self._send_seg(ack, addr)
+            self.state = 'CLOSED'
+            self.close_event.set()
+        elif seg.has_flag(ACK):
+            self.state = 'CLOSED'
+            self.close_event.set()
+
     def _process_data(self, seg, addr):
         """
         Process a data segment. Only accepts in-order segments
-        (seq_num == expected). Sends cumulative ACK either way.
+        (seq_num == expected) that fit in the buffer. Sends
+        cumulative ACK either way with current rwnd.
         """
+        remaining = self.receive_buffer_size - len(self.data_buffer)
         if (seg.seq_num == self.expected_seq_num
-                and seg.payload_length > 0):
+                and seg.payload_length > 0
+                and seg.payload_length <= remaining):
             self.data_buffer.extend(seg.payload)
             self.expected_seq_num += seg.payload_length
             self.data_cond.notify_all()
 
-        # always send cumulative ack with current rwnd
-        # with GBN the receiver doesn't buffer out-of-order segments,
-        # so rwnd just advertises the receive buffer size
+        # always send cumulative ack with how much space is left
+        rwnd = max(0, self.receive_buffer_size - len(self.data_buffer))
         ack = Segment(
             self.src_port, seg.src_port,
             seq_num=0, ack_num=self.expected_seq_num,
-            flags=ACK, rwnd=self.receive_buffer_size
+            flags=ACK, rwnd=rwnd
         )
         self._send_seg(ack, addr)
 

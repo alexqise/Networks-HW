@@ -7,6 +7,9 @@
 #
 
 import socket # for UDP connection
+import threading
+
+from mrt_segment import Segment, HEADER_SIZE, SYN, ACK, FIN, DATA
 
 class Client:
     def init(self, src_port, dst_addr, dst_port, segment_size):
@@ -23,10 +26,24 @@ class Client:
         self.dst_addr = dst_addr
         self.dst_port = dst_port
         self.segment_size = segment_size
+        self.max_payload = segment_size - HEADER_SIZE
 
-        # Create and bind UDP socket
+        # create and bind UDP socket
+        # short timeout so the handler thread can interleave send/recv
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(('', src_port))
+        self.sock.settimeout(0.01)
+
+        # connection state
+        self.state = 'CLOSED'
+        self.lock = threading.Lock()
+        self.running = True
+
+        # spawn handler thread
+        self.handler_thread = threading.Thread(
+            target=self._rcv_and_sgmnt_handler, daemon=True
+        )
+        self.handler_thread.start()
 
     def connect(self):
         """
@@ -47,8 +64,17 @@ class Client:
         arguments:
         data -- the bytes to be sent to the server
         """
-        # Phase 1: simple raw UDP send for testing
-        self.sock.sendto(data, (self.dst_addr, self.dst_port))
+        # phase 3: just send raw segments through the handler for now
+        offset = 0
+        while offset < len(data):
+            chunk = data[offset:offset + self.max_payload]
+            seg = Segment(
+                self.src_port, self.dst_port,
+                seq_num=offset, ack_num=0,
+                flags=DATA, rwnd=0, payload=chunk
+            )
+            self.sock.sendto(seg.to_bytes(), (self.dst_addr, self.dst_port))
+            offset += len(chunk)
         return len(data)
 
     def close(self):
@@ -56,4 +82,21 @@ class Client:
         request to close the connection with the server
         blocking until the connection is closed
         """
+        self.running = False
         self.sock.close()
+
+    def _rcv_and_sgmnt_handler(self):
+        """
+        Handler thread that continuously receives and processes
+        incoming segments. For now just prints what it gets.
+        """
+        while self.running:
+            try:
+                raw, addr = self.sock.recvfrom(65535)
+                seg = Segment.from_bytes(raw)
+                if seg is None:
+                    continue  # corrupt, drop
+                with self.lock:
+                    print(f"[client] got {seg.type_str()} seq={seg.seq_num} ack={seg.ack_num}")
+            except (socket.timeout, BlockingIOError, OSError):
+                pass
